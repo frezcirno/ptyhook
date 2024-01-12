@@ -10,8 +10,8 @@
 #define PTYHOOK_CTRL_NAME "ptyhook"
 #define PTYHOOK_DATA_NAME "ptyhook_data"
 
-static unsigned int tty_index = 0;
-module_param(tty_index, uint, 0);
+static int tty_index = -1;
+module_param(tty_index, int, 0644);
 
 static struct proc_dir_entry *ph_ctrl;
 static struct proc_dir_entry *ph_data;
@@ -121,8 +121,8 @@ out:
 }
 
 /* read line by line
- * if 0 -> stop hook
- * if positive number -> start hook
+ * if -1 -> stop hook
+ * if >= 0 -> start hook
  */
 static ssize_t ph_ctrl_write(struct file *file, const char __user *ubuf,
                              size_t len, loff_t *off) {
@@ -165,6 +165,7 @@ static const struct proc_ops ph_ctrl_fops =
 },
                              ph_data_fops = {
                                  .proc_read = ph_data_read,
+                                 .proc_lseek = noop_llseek,
 };
 
 static int pre_pty_write(struct kprobe *t_kp, struct pt_regs *regs) {
@@ -230,7 +231,7 @@ static int __init kprobe_init(void) {
     goto err_data;
   }
 
-  if (tty_index > 0) {
+  if (tty_index >= 0) {
     ret = start_hook();
     if (ret < 0)
       goto err_reg;
