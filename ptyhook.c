@@ -19,6 +19,7 @@ static struct proc_dir_entry *ph_data;
 static int hooked = 0;
 
 /* The ring buffer used to store character for this module
+ * One producer, one consumer
  * [            ************     ]
  *              |          |
  *             tail       head
@@ -26,9 +27,9 @@ static int hooked = 0;
  *            |               |
  *           head            tail
  */
-static char ph_buf[1024 * 1024];
-static size_t ph_buf_head = 0;
-static size_t ph_buf_tail = 0;
+static char ph_buf[10 * 1024 * 1024];
+static volatile size_t ph_buf_head = 0;
+static volatile size_t ph_buf_tail = 0;
 
 // return the number of bytes in ph_buf
 static inline size_t ph_buf_size(void) {
@@ -168,25 +169,72 @@ static const struct proc_ops ph_ctrl_fops =
                                  .proc_lseek = noop_llseek,
 };
 
-static int pre_pty_write(struct kprobe *t_kp, struct pt_regs *regs) {
+static void post_pty_write(struct kprobe *t_kp, struct pt_regs *regs,
+                           unsigned long flags) {
   struct tty_struct *tty = (struct tty_struct *)regs->di;
   const unsigned char *buf = (const unsigned char *)regs->si;
+  unsigned char direction;
   int c = regs->dx;
+  int cc = c;
+  unsigned char minibuf[5];
 
-  if (tty->flow.stopped || !c)
-    return 0;
-
+  // not the tty we want
   if (tty->index != tty_index)
-    return 0;
+    return;
 
-  ph_buf_put(buf, c);
+  if (tty > tty->link)
+    direction = 0;
+  else
+    direction = 1;
 
-  return 0;
+  // UTF-8 like encoding
+  // 1 bit direction, x bit sizsize, y bit size, z bit data
+  // if sizsize == 0, size takes 6 bits (0~63), data takes `size` bytes
+  memset(minibuf, 0, sizeof(minibuf));
+  if (c < 64) {
+    minibuf[0] = (direction << 7) | (c);
+    ph_buf_put(minibuf, 1);
+    ph_buf_put(buf, cc);
+  }
+  // if sizsize == 10, size takes 5+8 bits (0~8191)
+  else if (c < 8192) {
+    minibuf[0] = (direction << 7) | 0x40 | (c >> 8);
+    minibuf[1] = c & 0xff;
+    ph_buf_put(minibuf, 2);
+    ph_buf_put(buf, cc);
+  }
+  // if sizsize == 110, size takes 4+16 bits (0~1048575)
+  else if (c < 1048576) {
+    minibuf[0] = (direction << 7) | 0x60 | (c >> 16);
+    minibuf[1] = (c >> 8) & 0xff;
+    minibuf[2] = c & 0xff;
+    ph_buf_put(minibuf, 3);
+    ph_buf_put(buf, cc);
+  }
+  // if sizsize == 111 0, size takes 3+24 bits
+  else if (c < 134217728) {
+    minibuf[0] = (direction << 7) | 0x70 | (c >> 24);
+    minibuf[1] = (c >> 16) & 0xff;
+    minibuf[2] = (c >> 8) & 0xff;
+    minibuf[3] = c & 0xff;
+    ph_buf_put(minibuf, 4);
+    ph_buf_put(buf, cc);
+  }
+  // if sizsize == 111 1, 3 bit not use, size takes 32 bits
+  else {
+    minibuf[0] = (direction << 7) | 0x78;
+    minibuf[1] = (c >> 24) & 0xff;
+    minibuf[2] = (c >> 16) & 0xff;
+    minibuf[3] = (c >> 8) & 0xff;
+    minibuf[4] = c & 0xff;
+    ph_buf_put(minibuf, 5);
+    ph_buf_put(buf, cc);
+  }
 }
 
 static struct kprobe kp_pty_write = {
     .symbol_name = "pty_write",
-    .pre_handler = pre_pty_write,
+    .post_handler = post_pty_write,
 };
 
 static struct kprobe *kps[] = {&kp_pty_write};
